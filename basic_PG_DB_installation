@@ -1,0 +1,204 @@
+################################################################################
+# 🧠 POSTGRESQL MASTER DBA INSTALLATION & STORAGE MANAGEMENT - CODE SHEET
+# Works on: Linux / WSL (Ubuntu)
+# Purpose: End-to-end setup from installation to advanced DBA storage planning
+################################################################################
+
+# -------------------------------
+# 🪜 STEP 1: Update System Packages
+# -------------------------------
+sudo apt update && sudo apt upgrade -y
+# ✅ Updates package lists and upgrades existing system packages to latest versions.
+
+# -------------------------------
+# 🪜 STEP 2: Install PostgreSQL
+# -------------------------------
+sudo apt install postgresql postgresql-contrib -y
+# ✅ Installs PostgreSQL and additional utilities (like pg_dump, pg_restore, etc.)
+
+# -------------------------------
+# 🪜 STEP 3: Switch to postgres System User
+# -------------------------------
+sudo -i -u postgres
+# ✅ The postgres user owns the PostgreSQL cluster and data directory.
+
+# -------------------------------
+# 🪜 STEP 4: Verify PostgreSQL Service & Cluster
+# -------------------------------
+pg_lsclusters
+# ✅ Lists available PostgreSQL clusters on the system.
+# Example Output: Version | Cluster | Port | Status | Owner | Data directory
+# PostgreSQL automatically creates a cluster during installation.
+
+# -------------------------------
+# 🪜 STEP 5: Stop Default Cluster (optional)
+# -------------------------------
+sudo pg_ctlcluster 16 main stop
+# ✅ Stops the default cluster (optional if you want to recreate it manually).
+
+# -------------------------------
+# 🪜 STEP 6: Create a New Cluster Manually (Advanced DBA Step)
+# -------------------------------
+sudo pg_createcluster 16 bank_cluster --datadir=/data/pgbank
+# ✅ Creates a new cluster named "bank_cluster" using PostgreSQL 16 binaries.
+# ✅ Data directory will be /data/pgbank (you can change path based on your storage plan).
+
+# -------------------------------
+# 🪜 STEP 7: Start the New Cluster
+# -------------------------------
+sudo pg_ctlcluster 16 bank_cluster start
+# ✅ Starts your custom cluster.
+
+# -------------------------------
+# 🪜 STEP 8: Connect to psql (PostgreSQL Command-Line Tool)
+# -------------------------------
+psql -p 5432 -U postgres
+# ✅ Connects to the PostgreSQL server as superuser "postgres" using default port 5432.
+# ✅ "psql" is the PostgreSQL interactive shell (CLI client).
+
+# -------------------------------
+# 🪜 STEP 9: Check Existing Databases
+# -------------------------------
+\l
+# ✅ Lists all databases.
+# Use \l+ to also show size and tablespace information.
+
+# -------------------------------
+# 🪜 STEP 10: Create Tablespace Directories
+# -------------------------------
+sudo mkdir -p /data/tbs_core
+sudo mkdir -p /data/tbs_audit
+sudo mkdir -p /data/tbs_archive
+
+# ✅ Creates three separate storage directories for logical separation of data.
+# In a bank project, core = transactions, audit = logs, archive = old data.
+
+# -------------------------------
+# 🪜 STEP 11: Set Permissions on Tablespaces
+# -------------------------------
+sudo chown -R postgres:postgres /data/tbs_core /data/tbs_audit /data/tbs_archive
+# ✅ PostgreSQL service user must own all tablespace directories.
+
+# -------------------------------
+# 🪜 STEP 12: Create Tablespaces in PostgreSQL
+# -------------------------------
+psql -U postgres
+
+CREATE TABLESPACE tbs_core LOCATION '/data/tbs_core';
+CREATE TABLESPACE tbs_audit LOCATION '/data/tbs_audit';
+CREATE TABLESPACE tbs_archive LOCATION '/data/tbs_archive';
+
+-- ✅ Each tablespace is a storage location for database objects (tables, indexes, etc.)
+-- ✅ Allows DBAs to distribute data across different disks for performance & management.
+
+# -------------------------------
+# 🪜 STEP 13: Create Databases Using Tablespaces
+# -------------------------------
+CREATE DATABASE bank_core WITH TABLESPACE = tbs_core;
+CREATE DATABASE bank_audit WITH TABLESPACE = tbs_audit;
+CREATE DATABASE bank_archive WITH TABLESPACE = tbs_archive;
+
+-- ✅ Each database now stores its data in its assigned tablespace.
+
+# -------------------------------
+# 🪜 STEP 14: Connect to a Database
+# -------------------------------
+\c bank_core
+-- ✅ Switch to "bank_core" database.
+
+# -------------------------------
+# 🪜 STEP 15: Create Schemas for Logical Separation
+# -------------------------------
+CREATE SCHEMA finance AUTHORIZATION postgres;
+CREATE SCHEMA hr AUTHORIZATION postgres;
+CREATE SCHEMA reporting AUTHORIZATION postgres;
+
+-- ✅ Schemas group tables logically within a database.
+
+# -------------------------------
+# 🪜 STEP 16: Create Tables within Schemas
+# -------------------------------
+CREATE TABLE finance.transactions (
+    txn_id SERIAL PRIMARY KEY,
+    txn_date TIMESTAMP DEFAULT NOW(),
+    amount NUMERIC(12,2),
+    description TEXT
+) TABLESPACE tbs_core;
+
+CREATE TABLE hr.employees (
+    emp_id SERIAL PRIMARY KEY,
+    name TEXT,
+    department TEXT,
+    salary NUMERIC(10,2)
+) TABLESPACE tbs_core;
+
+-- ✅ Tables created in schemas, stored in tbs_core.
+
+# -------------------------------
+# 🪜 STEP 17: Check Tablespace Locations
+# -------------------------------
+SELECT spcname, pg_tablespace_location(oid) FROM pg_tablespace;
+
+-- ✅ Shows physical path of each tablespace.
+
+# -------------------------------
+# 🪜 STEP 18: Check Database and Table Sizes
+# -------------------------------
+\l+
+-- ✅ Shows size and tablespace of all databases.
+
+SELECT pg_size_pretty(pg_database_size('bank_core'));
+SELECT pg_size_pretty(pg_total_relation_size('finance.transactions'));
+
+-- ✅ Displays human-readable size of databases and tables.
+
+# -------------------------------
+# 🪜 STEP 19: Apply OS-Level Quota (Advanced)
+# -------------------------------
+# Exit postgres user shell first
+exit
+
+# Apply a 10GB quota limit to the postgres user on /data mount point
+sudo setquota -u postgres 0 10240 0 0 /data
+
+# ✅ This restricts postgres user to 10GB disk usage under /data.
+# ✅ PostgreSQL itself doesn’t enforce size limits — Linux filesystem does.
+
+# -------------------------------
+# 🪜 STEP 20: Monitor Cluster Health
+# -------------------------------
+sudo -i -u postgres
+psql -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) FROM pg_database;"
+# ✅ Lists sizes of all databases for monitoring.
+
+# To check running connections:
+psql -c "SELECT datname, usename, client_addr, state FROM pg_stat_activity;"
+
+# -------------------------------
+# 🪜 STEP 21: Move Tables Between Tablespaces (If Needed)
+# -------------------------------
+ALTER TABLE finance.transactions SET TABLESPACE tbs_archive;
+
+-- ✅ Physically moves table data to another tablespace.
+-- ✅ Useful for archiving old data or performance balancing.
+
+# -------------------------------
+# 🪜 STEP 22: Backup and Restore (For Later DBA Practice)
+# -------------------------------
+# Full database backup
+pg_dump -U postgres -d bank_core -F c -f /data/backup/bank_core.dump
+
+# Restore into new database
+pg_restore -U postgres -d bank_core_restore /data/backup/bank_core.dump
+
+################################################################################
+# ✅ DBA MASTER NOTES
+################################################################################
+# 🔹 psql — PostgreSQL command-line client (used to execute SQL commands)
+# 🔹 pg_dump / pg_restore — for backups and restores
+# 🔹 Tablespaces — manage physical storage locations
+# 🔹 OS Quotas — enforce disk usage limits
+# 🔹 Schemas — organize data logically
+# 🔹 Monitoring Views — pg_stat_activity, pg_database_size(), pg_stat_user_tables
+# 🔹 Cluster — group of databases managed by one PostgreSQL instance
+################################################################################
