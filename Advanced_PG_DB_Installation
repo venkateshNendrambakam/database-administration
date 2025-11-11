@@ -1,0 +1,529 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# POSTGRESQL MASTER DBA CODE SHEET (Deep-Explanation Version)
+# Target: Ubuntu / Debian-family (works in WSL for learning; for real servers, run on full Linux)
+# Purpose: Production-style master DBA setup + storage, security, backups, monitoring
+# WARNING: Change passwords, IPs, and sensitive values before using on real systems.
+# ==============================================================================
+
+# --------------------------
+# SECTION A: HIGH-LEVEL CONCEPTS (READ FIRST)
+# --------------------------
+# NOTE: These are short, key concept definitions you must understand before running commands.
+# - PostgreSQL "cluster" = one running PostgreSQL server process that manages a collection
+#   of databases. A cluster corresponds to one data directory (PGDATA) and one set of config files.
+# - PGDATA = the directory where the cluster stores data files, WAL, config files (postgresql.conf, pg_hba.conf).
+# - WAL (Write-Ahead Log) = append-only log of every change; used for crash recovery and replication.
+# - Tablespace = a named pointer in PostgreSQL to a filesystem directory where database objects can be stored.
+# - pg_hba.conf = file that controls client authentication (who can log in, from where, how).
+# - postgresql.conf = main server configuration file (memory settings, logging, WAL, listen addresses).
+# - initdb = command that "creates/initializes" a new PostgreSQL cluster (writes system catalogs, config files).
+# --------------------------
+# Read the comments and the following commands carefully; every line is explained.
+# --------------------------
+
+
+# --------------------------
+# SECTION B: PREPARE THE OS (package updates, required utils)
+# --------------------------
+sudo apt update && sudo apt upgrade -y
+# Explanation: Refresh apt cache (update) and upgrade installed packages to latest. Keeps OS dependencies current.
+
+sudo apt install -y curl ca-certificates gnupg lsb-release apt-transport-https vim less
+# Explanation: Install utilities used below:
+# - curl: fetch files and keys
+# - ca-certificates: for TLS verification
+# - gpg: for handling repository keys
+# - lsb-release: to detect distro codename (e.g., jammy)
+# - apt-transport-https: allow apt to use https repositories
+# - vim/less: editors/viewers for config inspection
+
+
+# --------------------------
+# SECTION C: INSTALL OFFICIAL POSTGRESQL REPOSITORY (PGDG)
+# --------------------------
+# Why: The distro repo often has older versions. Official PGDG repo gives latest stable versions.
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+# Explanation: Download PGDG signing key and store as a keyring for apt to trust packages.
+
+echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+  | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+# Explanation: Add PGDG repository entry for your Ubuntu/Debian codename (lsb_release -cs expands to e.g., jammy).
+
+sudo apt update
+# Explanation: Refresh apt caches to include packages from new PGDG repo.
+
+
+# --------------------------
+# SECTION D: INSTALL POSTGRESQL (SERVER + CLIENT + CONTRIBUTIONS)
+# --------------------------
+PGVER=16
+# Explanation: Major version to install. Change this if you want another major release.
+
+sudo apt install -y "postgresql-$PGVER" "postgresql-client-$PGVER" "postgresql-contrib-$PGVER"
+# Explanation:
+# - postgresql-X : server daemon & packaging scripts
+# - postgresql-client-X : CLI tools (psql, pg_dump, pg_restore)
+# - postgresql-contrib-X : optional but useful extensions (pg_stat_statements, pgcrypto, etc.)
+
+# After installation, a default cluster is usually created at /var/lib/postgresql/$PGVER/main
+# but we are going to create a production-style cluster with custom directories below.
+
+
+# --------------------------
+# SECTION E: STOP DEFAULT SERVICE (if created) - prepare manual cluster creation
+# --------------------------
+sudo systemctl stop postgresql || true
+# Explanation: Stop the distro-managed service so we can safely initialize and configure custom PGDATA, WAL, logs, etc.
+# '|| true' prevents script exit if service wasn't running.
+
+
+# --------------------------
+# SECTION F: PLAN DIRECTORIES & PERMISSIONS (Master DBA planning)
+# --------------------------
+# Strategy: separate directories for data (PGDATA), WAL, logs, backups, and tablespaces (per workload).
+# This helps with I/O isolation and makes disaster recovery predictable.
+
+# Example paths (change to match your mounts or LVM volumes)
+PGDATA="/pgdata/main"         # main data directory (cluster)
+WALDIR="/pgwal"              # separate WAL directory (fast disk)
+PGLOG="/pglog"               # CSV or plain logs
+BACKUPDIR="/pgbackup"        # backup storage (local staging; send to remote target in production)
+TBSDIR_BASE="/pgdata/tbs"    # base directory for tablespaces
+
+# Create directories and set restrictive permissions
+sudo mkdir -p "$PGDATA" "$WALDIR" "$PGLOG" "$BACKUPDIR" "$TBSDIR_BASE"
+sudo chown -R postgres:postgres "$PGDATA" "$WALDIR" "$PGLOG" "$BACKUPDIR" "$TBSDIR_BASE"
+sudo chmod 700 "$PGDATA" "$WALDIR" "$PGLOG" "$BACKUPDIR" "$TBSDIR_BASE"
+
+# Explanation:
+# - mkdir -p: create directories recursively
+# - chown postgres:postgres: PostgreSQL process runs as 'postgres' user; it must own these dirs.
+# - chmod 700: only the owner (postgres) can read/write/execute — security best practice.
+
+
+# --------------------------
+# SECTION G: SYSCTL / KERNEL TUNING (Shared memory & swappiness)
+# --------------------------
+# NOTE: On WSL, some kernel tuning may not be available. On a real server, tune according to system RAM.
+# Example settings (adjust to actual server RAM; these are illustrative)
+sudo bash -c 'cat > /etc/sysctl.d/99-postgres-shm.conf <<EOF
+# PostgreSQL recommended kernel tuning (adjust values per actual RAM)
+kernel.shmmax = 68719476736     # max size in bytes for a single shared memory segment (~64GB)
+kernel.shmall = 4294967296      # total shared memory pages (system wide)
+vm.swappiness = 1               # avoid swapping; keep memory resident
+EOF'
+sudo sysctl --system
+# Explanation:
+# - shmmax/shmall: control how much shared memory kernel allows (Postgres uses shared memory for shared_buffers)
+# - vm.swappiness: lower value reduces swapping tendency (swap hurts DB performance)
+# - sysctl --system reloads settings
+
+
+# --------------------------
+# SECTION H: INITDB — CREATE A NEW CLUSTER (Master DBA manual init)
+# --------------------------
+# We will run initdb as the postgres OS user to create a clean, controlled cluster.
+sudo -i -u postgres bash <<'INITDB_CMDS'
+# initdb creates PGDATA structure and initial minimal DB (template0, template1, postgres)
+# --encoding and --locale ensure consistent text handling
+# --auth-local and --auth-host set default authentication methods for socket and TCP connections
+/usr/lib/postgresql/$PGVER/bin/initdb \
+  -D "$PGDATA" \
+  --encoding=UTF8 \
+  --locale=en_US.UTF-8 \
+  --auth-local=peer \
+  --auth-host=md5 \
+  --pwfile=<(echo "CHANGE_THIS_POSTGRES_PASSWORD")
+# Note: Using pwfile sets initial postgres password non-interactively; change in production to secret management
+INITDB_CMDS
+
+# Explanation:
+# - initdb writes postgresql.conf, pg_hba.conf, PG_VERSION and system catalogs into PGDATA
+# - --auth-local=peer: local unix socket connections by OS users are matched to DB users (good for admin)
+# - --auth-host=md5: host (TCP) connections require password (md5 hashed) by default
+# - pwfile provides initial postgres password; replace with secure secret or integrate with secret store.
+
+
+# --------------------------
+# SECTION I: ADJUST SYSTEMD (Service override to use custom PGDATA & WAL)
+# --------------------------
+# Explanation: The distro's postgres service reads PGDATA from environment; we override systemd to point at our new PGDATA.
+sudo mkdir -p /etc/systemd/system/postgresql@.service.d
+sudo bash -c 'cat > /etc/systemd/system/postgresql@.service.d/override.conf <<EOF
+[Service]
+Environment=PGDATA=/pgdata/main
+EOF'
+sudo systemctl daemon-reload
+# Explanation:
+# - Creates a systemd drop-in for the named service instance so systemd uses PGDATA=/pgdata/main
+# - daemon-reload tells systemd to re-read unit files
+
+
+# --------------------------
+# SECTION J: CONFIGURE postgresql.conf (Detailed, explain each key)
+# --------------------------
+# We will append recommended production settings. Open file and inspect in real life:
+PGCONF="$PGDATA/postgresql.conf"
+# Basic listen and port
+sudo sed -i "s/^#listen_addresses =.*/listen_addresses = '*'/" "$PGCONF" || true
+sudo sed -i "s/^#port = 5432/port = 5432/" "$PGCONF" || true
+
+# Append tuned settings (adjust memory sizes to actual machine RAM)
+sudo bash -c "cat >> $PGCONF <<'PGCONF_APPEND'
+
+# ---------- Master DBA recommended settings ----------
+# Connections & Memory
+max_connections = 500                # maximum concurrent connections allowed (set per workload)
+shared_buffers = 2GB                 # memory area for caching table data (roughly 25% of RAM recommended)
+effective_cache_size = 6GB           # planner estimate of available OS cache (set to ~50-75% of RAM)
+work_mem = 16MB                      # per-sort / per-hash memory (increase for large queries, but per backend)
+maintenance_work_mem = 512MB         # used for index builds, VACUUM operations
+max_parallel_workers_per_gather = 2
+
+# WAL & Checkpoints
+wal_level = replica                  # use 'replica' to enable streaming replication and WAL archiving
+archive_mode = on                    # enable WAL archiving for PITR
+archive_command = 'test ! -f \"$BACKUPDIR/wal/%f\" && cp %p \"$BACKUPDIR/wal/%f\"' 
+# copy each WAL segment into backup dir; production should upload to remote storage
+archive_timeout = 60                 # force switch every 60s if needed
+
+# Logging
+logging_collector = on               # collect logs to files
+log_destination = 'csvlog'           # csvlog easier to parse with tools
+log_directory = '$PGLOG'             # where logs are stored
+log_filename = 'postgresql-%a.log'   # rotate by weekday
+log_truncate_on_rotation = on
+log_rotation_age = 1d
+log_min_duration_statement = 500     # log queries slower than 500ms (adjust to your SLAs)
+
+# Stats / Extensions
+shared_preload_libraries = 'pg_stat_statements'  # load extension at server start
+pg_stat_statements.max = 10000
+pg_stat_statements.track = all
+
+# Autovacuum tuning (initial)
+autovacuum = on
+autovacuum_max_workers = 3
+autovacuum_naptime = 10s
+autovacuum_vacuum_cost_limit = 200
+
+# Misc
+default_statistics_target = 100
+checkpoint_completion_target = 0.9
+random_page_cost = 1.1
+effective_io_concurrency = 200
+
+PGCONF_APPEND"
+# Explanation (key points):
+# - shared_buffers: how much memory Postgres will use for caching table pages. Too low hurts performance.
+# - effective_cache_size: informs planner of available OS file system cache.
+# - wal_level + archive_mode + archive_command: enable archive and set method for storing WAL segments for PITR.
+# - logging: enabling logging to file is crucial for audits and diagnosing problems.
+# - shared_preload_libraries: pg_stat_statements must be loaded on server start to collect query stats.
+# - autovacuum: background process to reclaim space and maintain performance.
+
+
+# --------------------------
+# SECTION K: CONFIGURE pg_hba.conf (Authentication rules)
+# --------------------------
+PGHBA="$PGDATA/pg_hba.conf"
+sudo cp "$PGHBA" "${PGHBA}.bak"
+sudo bash -c "cat > $PGHBA <<'PGHBA_CONF'
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+# Local socket connections (good for administrative scripts)
+local   all             postgres                                peer
+# Local socket connections for other db users — require password
+local   all             all                                     md5
+# Loopback TCP connections allowed (localhost)
+host    all             all             127.0.0.1/32            md5
+host    all             all             ::1/128                 md5
+# Example: allow internal bank subnet (change to real network)
+host    all             all             10.20.30.0/24           md5
+# Replication user rule (allow replication connections)
+host    replication     repl            10.20.30.0/24           md5
+PGHBA_CONF"
+# Explanation:
+# - pg_hba.conf lines control how connections are authenticated.
+# - 'peer' allows local OS user 'postgres' to connect as DB user 'postgres' without password.
+# - 'md5' forces password authentication over TCP.
+# - Always restrict host entries to known subnets. Avoid allowing 0.0.0.0/0.
+
+
+# --------------------------
+# SECTION L: ENABLE SSL (self-signed for learning; use CA-signed cert in prod)
+# --------------------------
+SSL_DIR="$PGDATA/ssl"
+sudo -u postgres mkdir -p "$SSL_DIR"
+sudo -u postgres openssl req -new -x509 -days 3650 -nodes \
+  -subj "/CN=postgres" \
+  -out "$SSL_DIR/server.crt" -keyout "$SSL_DIR/server.key"
+sudo chmod 600 "$SSL_DIR/server.key"
+sudo chown postgres:postgres "$SSL_DIR/server.crt" "$SSL_DIR/server.key"
+
+# persist SSL settings in postgresql.conf if not already set
+sudo bash -c "grep -q '^ssl = on' $PGCONF || echo \"ssl = on\" >> $PGCONF"
+sudo bash -c "grep -q \"ssl_cert_file\" $PGCONF || echo \"ssl_cert_file = '$SSL_DIR/server.crt'\" >> $PGCONF"
+sudo bash -c "grep -q \"ssl_key_file\" $PGCONF || echo \"ssl_key_file = '$SSL_DIR/server.key'\" >> $PGCONF"
+
+# Explanation:
+# - SSL encrypts client-server traffic. Use CA-signed certs for production and set ssl_ca_file for client cert validation.
+# - File permissions: key must be readable only by postgres (600).
+
+
+# --------------------------
+# SECTION M: START DATABASE CLUSTER
+# --------------------------
+# Use pg_ctl to start cluster from the custom PGDATA directory
+sudo -i -u postgres /usr/lib/postgresql/$PGVER/bin/pg_ctl -D "$PGDATA" -l "$PGLOG/server_start.log" start
+# Explanation:
+# - pg_ctl reads postgresql.conf in PGDATA and starts a postgres server process
+# - -l logs initial server stdout/stderr to server_start.log
+
+
+# --------------------------
+# SECTION N: CREATE TABLESPACES (separate storage for different workloads)
+# --------------------------
+# Create directories for specific tablespaces (io isolation)
+sudo mkdir -p /data/tbs_txn /data/tbs_audit /data/tbs_reporting
+sudo chown postgres:postgres /data/tbs_txn /data/tbs_audit /data/tbs_reporting
+sudo chmod 700 /data/tbs_txn /data/tbs_audit /data/tbs_reporting
+
+# Create the tablespaces inside PostgreSQL (run as postgres user)
+sudo -u postgres psql -v ON_ERROR_STOP=1 <<'PSQL_TBS'
+-- Each CREATE TABLESPACE registers a directory as a named tablespace.
+CREATE TABLESPACE tbs_txn OWNER postgres LOCATION '/data/tbs_txn';
+CREATE TABLESPACE tbs_audit OWNER postgres LOCATION '/data/tbs_audit';
+CREATE TABLESPACE tbs_reporting OWNER postgres LOCATION '/data/tbs_reporting';
+\q
+PSQL_TBS
+# Explanation:
+# - Tablespaces let you put certain databases/tables on particular disks (e.g., put WAL and indexes on fast SSD).
+
+
+# --------------------------
+# SECTION O: CREATE ROLES, REPLICATION USER, AND SAMPLE DB
+# --------------------------
+# Create roles and sample DBs. In production, avoid SUPERUSER for daily admin; use specific privileges.
+sudo -u postgres psql -v ON_ERROR_STOP=1 <<'PSQL_ROLES'
+-- Set a secure postgres password (replace with secure secret from vault)
+ALTER USER postgres WITH PASSWORD 'CHANGE_ME_STRONG_PASS';
+
+-- Create an admin role (bankdba) and replication role (repl)
+CREATE ROLE bankdba WITH LOGIN PASSWORD 'Bank@dba1' CREATEDB CREATEROLE;
+CREATE ROLE repl WITH REPLICATION LOGIN PASSWORD 'Repl@123';
+-- Create sample databases assigned to tablespaces
+CREATE DATABASE bank_core OWNER bankdba TABLESPACE tbs_txn;
+CREATE DATABASE bank_audit OWNER bankdba TABLESPACE tbs_audit;
+CREATE DATABASE bank_reporting OWNER bankdba TABLESPACE tbs_reporting;
+\q
+PSQL_ROLES
+# Explanation:
+# - bankdba: administrative role with privileges to create DBs and roles (not full SUPERUSER here)
+# - repl: replication-only role used by streaming replication and pg_basebackup
+
+
+# --------------------------
+# SECTION P: ENABLE EXTENSIONS (pg_stat_statements) AND INITIAL CHECKS
+# --------------------------
+# Enable pg_stat_statements in each database where you want query stats (requires restart because of shared_preload_libraries)
+sudo -u postgres psql -d bank_core -v ON_ERROR_STOP=1 <<'PSQL_EXT'
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+-- Quick check
+SELECT name, setting FROM pg_settings WHERE name IN ('shared_buffers','max_connections');
+\q
+PSQL_EXT
+# Explanation:
+# - pg_stat_statements collects statement-level statistics (calls, total time). Important for tuning and slow-query analysis.
+
+
+# --------------------------
+# SECTION Q: TAKE A PHYSICAL BASE BACKUP (pg_basebackup) AS EXAMPLE
+# --------------------------
+# Ensure backup directory exists and is owned by postgres
+sudo mkdir -p "$BACKUPDIR/base"
+sudo chown postgres:postgres "$BACKUPDIR/base"
+sudo chmod 700 "$BACKUPDIR/base"
+
+# Run pg_basebackup (takes a physical backup, includes WAL if -Xs used)
+# Note: pg_basebackup connects as replication user; requires proper pg_hba.conf allowing it.
+sudo -i -u postgres /usr/lib/postgresql/$PGVER/bin/pg_basebackup \
+  -D "$BACKUPDIR/base" -Fp -Xs -P -U repl || true
+# Explanation:
+# - -D: destination directory for the base backup
+# - -F p: plain directory format (copy of data files)
+# - -Xs: include WAL files by streaming them to backup location (ensures a consistent backup)
+# - -P: show progress
+# -U repl: use replication role to run the backup
+
+
+# --------------------------
+# SECTION R: LOG ROTATION & CRON BACKUPS (EXAMPLES)
+# --------------------------
+# Example: create backup WAL dir and rotate backups via cron (simple approach)
+sudo mkdir -p "$BACKUPDIR/wal"
+sudo chown postgres:postgres "$BACKUPDIR/wal"
+sudo chmod 700 "$BACKUPDIR/wal"
+
+# Example cron job: daily logical backup at 02:30 (runs as postgres)
+CRONFILE="/etc/cron.d/pg_daily_backup"
+sudo bash -c "cat > $CRONFILE <<'CRON'
+# minute hour day month weekday user   command
+30 2 * * * postgres /usr/bin/pg_dump -U postgres -F c -d bank_core -f $BACKUPDIR/bank_core_\$(date +\\%F).dump
+# rotate older backups - keep last 7 days (simple retention)
+35 2 * * * root find $BACKUPDIR -maxdepth 1 -type f -name 'bank_core_*.dump' -mtime +7 -exec rm {} \\;
+CRON"
+sudo chmod 644 "$CRONFILE"
+# Explanation:
+# - pg_dump creates logical backups (portable, restore with pg_restore)
+# - Cron automates daily backups and retention (production needs more robust scheduling & offsite copy)
+
+
+# --------------------------
+# SECTION S: QUICK MONITORING COMMANDS (Run interactively)
+# --------------------------
+# Check server readiness (outside psql)
+sudo -u postgres /usr/lib/postgresql/$PGVER/bin/pg_isready -q || echo "Postgres not ready"
+# Explanation: pg_isready checks whether server is accepting connections.
+
+# Inspect active sessions & running queries (inside psql)
+sudo -u postgres psql -c "SELECT pid, usename, datname, client_addr, state, query_start, substring(query,1,100) AS query_snippet FROM pg_stat_activity ORDER BY query_start DESC LIMIT 20;"
+# Explanation: Shows open connections and running queries; useful for killing long-running queries or auditing.
+
+# View database sizes
+sudo -u postgres psql -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) FROM pg_database ORDER BY pg_database_size(datname) DESC;"
+# Explanation: Shows size of each DB in human-readable format.
+
+# View tablespace locations
+sudo -u postgres psql -c "SELECT spcname, pg_tablespace_location(oid) AS location FROM pg_tablespace;"
+# Explanation: Verifies that tablespaces are mapped to intended filesystem paths
+
+
+# --------------------------
+# SECTION T: MOVE TABLES / INDEXES BETWEEN TABLESPACES (online operation)
+# --------------------------
+# Example: move a table to the archive tablespace (run inside psql)
+sudo -u postgres psql -d bank_core -v ON_ERROR_STOP=1 <<'PSQL_MOVE'
+-- To move a table: ALTER TABLE ... SET TABLESPACE new_tbs;
+CREATE TABLE IF NOT EXISTS finance_sample (id serial PRIMARY KEY, info text) TABLESPACE tbs_txn;
+INSERT INTO finance_sample (info) VALUES ('sample');
+-- Move to reporting tablespace
+ALTER TABLE finance_sample SET TABLESPACE tbs_reporting;
+-- Check where the table lives
+SELECT relname, pg_tablespace_location(reltablespace) FROM pg_class WHERE relname='finance_sample';
+\q
+PSQL_MOVE
+# Explanation:
+# - ALTER TABLE ... SET TABLESPACE physically rewrites the table to the new tablespace directory.
+
+
+# --------------------------
+# SECTION U: PITR (POINT IN TIME RECOVERY) - HIGH LEVEL STEPS (do in sequence in test env)
+# --------------------------
+# High level steps (not a single command):
+# 1) Ensure archive_mode=on and archive_command copies WAL segments to safe location (we set above).
+# 2) Take a base backup (pg_basebackup) and copy WAL segments thereafter to $BACKUPDIR/wal (we set this).
+# 3) To restore to a point in time:
+#    - Stop postgres.
+#    - Move current PGDATA out of the way (rename).
+#    - Restore base backup into PGDATA.
+#    - Create recovery.signal (Postgres 12+) or restore_command in recovery.conf (older versions) to fetch WALs.
+#    - Start postgres; use recovery_target_time to specify point in time.
+# Example (outline commands - DO NOT run on production without fully understanding):
+# sudo systemctl stop postgresql
+# mv /pgdata/main /pgdata/main.old
+# cp -a /pgbackup/base/* /pgdata/main
+# create file /pgdata/main/recovery.signal and in postgresql.conf set recovery_target_time = '2025-11-11 10:30:00'
+# start postgres and watch the logs for successful recovery.
+# Explanation:
+# - PITR lets you restore DB to any point in time after the base backup (requires archived WALs).
+
+
+# --------------------------
+# SECTION V: REPLICATION PREP (STREAMING REPLICATION - brief setup notes)
+# --------------------------
+# Basic idea:
+# - On primary: create replication role (we created 'repl'), allow in pg_hba.conf, enable wal_level=replica.
+# - Take a physical base backup (pg_basebackup) and copy to standby server.
+# - On standby: create recovery.signal and set primary_conninfo with host/user/password to primary.
+# - Start standby; streaming replication will keep WALs sent to standby.
+# Example primary_conninfo (in standby's postgresql.conf or in connection file):
+# primary_conninfo = 'host=primary_host port=5432 user=repl password=Repl@123 application_name=standby1'
+# Explanation:
+# - Streaming replication provides near real-time copies of data for HA and read-scaling.
+
+
+# --------------------------
+# SECTION W: AUTOVACUUM & MAINTENANCE (why and how)
+# --------------------------
+# autovacuum reclaims dead tuples (deleted/updated rows) and maintains stats for planner.
+# Tune autovacuum settings in postgresql.conf (we set autovacuum_max_workers and cost limits above).
+# For manual maintenance:
+# - VACUUM (FULL) locks table and compacts it — use sparingly.
+# - REINDEX rebuilds indexes.
+# Example manual maintenance command (run as postgres):
+sudo -u postgres psql -d bank_core -c "VACUUM (VERBOSE, ANALYZE) VERBOSE;"
+# Explanation:
+# - ANALYZE updates statistics for query planner.
+# - VACUUM (without FULL) is online and safe; FULL is heavy and blocks.
+
+
+# --------------------------
+# SECTION X: BACKUP RESTORE EXAMPLES (logical and physical)
+# --------------------------
+# Logical backup of a single DB (portable)
+sudo -u postgres /usr/bin/pg_dump -U postgres -F c -d bank_core -f "$BACKUPDIR/bank_core_$(date +%F).dump"
+# Explanation:
+# - pg_dump -F c: create a compressed custom-format dump; useful because pg_restore can parallelize restores.
+
+# Restore to a new DB with pg_restore:
+sudo -u postgres /usr/bin/createdb -O bankdba bank_core_restore
+sudo -u postgres /usr/bin/pg_restore -U postgres -d bank_core_restore -j 4 "$BACKUPDIR/bank_core_$(date +%F).dump"
+# Explanation:
+# - createdb creates target DB.
+# - pg_restore -j 4: use 4 parallel jobs to speed restore (works with custom/directory dumps).
+
+# Full cluster logical backup (roles, tablespaces, globals)
+sudo -u postgres pg_dumpall -g > "$BACKUPDIR/globals_$(date +%F).sql"
+# Explanation:
+# - pg_dumpall -g dumps global objects (roles, tablespaces, tablespace mappings) which are not included in pg_dump.
+
+# Physical base backup (we already ran pg_basebackup above) — used for fast entire-cluster restore and for standby creation.
+
+
+# --------------------------
+# SECTION Y: AUDIT & LOGGING (Important for banks)
+# --------------------------
+# Enable audit logs and connection tracking in postgresql.conf settings:
+# - log_connections = on
+# - log_disconnections = on
+# - log_statement = 'ddl' or use pgaudit extension for detailed auditing (install pgaudit if required)
+sudo -u postgres psql -c "ALTER SYSTEM SET log_connections = on;"
+sudo -u postgres psql -c "ALTER SYSTEM SET log_disconnections = on;"
+sudo -u postgres psql -c "SELECT pg_reload_conf();"
+# Explanation:
+# - ALTER SYSTEM writes config settings into postgresql.auto.conf; reloading applies them.
+# - Logs are vital for compliance, forensics, and diagnosing client behavior.
+
+
+# --------------------------
+# SECTION Z: FINAL CHECKS & VERIFICATION
+# --------------------------
+# Verify server is accepting connections and PGDATA location
+sudo -u postgres psql -c "SELECT version(), current_setting('data_directory') AS data_dir;"
+# Verify WAL archiving folder has files (if any)
+ls -la "$BACKUPDIR/wal" || echo "No WAL files archived yet"
+# Print tablespaces
+sudo -u postgres psql -c "SELECT spcname, pg_tablespace_location(oid) AS location FROM pg_tablespace;"
+
+# Print last few log lines
+sudo tail -n 50 "$PGLOG/postgresql-$(date +%a).log" 2>/dev/null || true
+
+# Provide final guidance
+echo "Master DBA setup complete (learning copy). IMPORTANT: change all plaintext passwords and move backups to offsite storage (S3 or remote backup server)."
+echo "Test restores (logical and PITR) in a safe test environment before trusting backups."
+
+# ==============================================================================
+# END OF MASTER DBA CODE SHEET
+# ==============================================================================
+
