@@ -22,6 +22,12 @@ sudo apt install postgresql postgresql-contrib -y
 sudo -i -u postgres
 # ✅ The postgres user owns the PostgreSQL cluster and data directory.
 
+flow: 
+cluster -> database -> sheama -> db objects like tables, views, indexs etc
+default paths:
+/var/lib/postgresql/16
+/etc/postgresql/16/main
+
 # -------------------------------
 # 🪜 STEP 4: Verify PostgreSQL Service & Cluster
 # -------------------------------
